@@ -612,6 +612,16 @@ class DataCube(_ProcessGraphAbstraction):
         :return: logical_and(this, other)
         """
         return self._operator_binary("and", other)
+    
+    @openeo_process(process_id="and", mode="operator")
+    def bitwise_and(self, other: "DataCube") -> "DataCube":
+        """
+        Apply bitwise-element-wise logical `and` operation
+
+        :param other:
+        :return: bitwise_and(this, other)
+        """
+        return self._operator_binary("bitwise_and", other)
 
     @openeo_process(process_id="and", mode="operator")
     def bitwise_and(self, other: "DataCube") -> "DataCube":
