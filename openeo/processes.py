@@ -274,6 +274,18 @@ class ProcessBuilder(ProcessBuilderBase):
         """
         return and_(x=self, y=y)
 
+    def __and__(self, y) -> "ProcessBuilder":
+        """
+        Bitwise AND
+
+        :param self: A (binary) value.
+        :param y: Another (binary) value.
+
+        :return: Boolean result of the logical AND.
+        """
+        return bitwise_and(x=self, y=y)
+
+
     def anomaly(self, normals, period) -> 'ProcessBuilder':
         """
         Compute anomalies
