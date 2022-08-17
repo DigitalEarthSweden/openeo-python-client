@@ -635,16 +635,27 @@ class Connection(RestApiConnection):
 
     def list_collections(self) -> List[dict]:
         """
-        Loads all available imagecollections types.
+        List basic metadata of all collections provided by the back-end.
 
-        :return: list of collection meta data dictionaries
+        .. caution::
+
+            Only the basic collection metadata will be returned.
+            To obtain full metadata of a particular collection,
+            it is recommended to use :py:meth:`~openeo.rest.connection.Connection.describe_collection` instead.
+
+        :return: list of dictionaries with basic collection metadata.
         """
         data = self.get('/collections', expected_status=200).json()["collections"]
         return VisualList("collections", data=data)
 
     def list_collection_ids(self) -> List[str]:
         """
-        Get list of all collection ids
+        List all collection ids provided by the back-end.
+
+        .. seealso::
+
+            :py:meth:`~openeo.rest.connection.Connection.describe_collection`
+            to get the metadata of a particular collection.
 
         :return: list of collection ids
         """
@@ -711,15 +722,20 @@ class Connection(RestApiConnection):
         services = self.get('/services', expected_status=200).json()["services"]
         return VisualList("data-table", data=services, parameters={'columns': 'services'})
 
-    def describe_collection(self, name) -> dict:
+    def describe_collection(self, collection_id: str) -> dict:
         """
-        Loads detailed information of a specific image collection.
+        Get full collection metadata for given collection id.
+        
+        .. seealso::
+        
+            :py:meth:`~openeo.rest.connection.Connection.list_collection_ids`
+            to list all collection ids provided by the back-end.
 
-        :param name: String Id of the collection
-        :return: data_dict: Dict Detailed information about the collection
+        :param collection_id: collection id
+        :return: collection metadata.
         """
         # TODO: duplication with `Connection.collection_metadata`: deprecate one or the other?
-        data = self.get('/collections/{}'.format(name), expected_status=200).json()
+        data = self.get(f"/collections/{collection_id}", expected_status=200).json()
         return VisualDict("collection", data=data)
 
     def collection_items(self, name, spatial_extent: Optional[List[float]] = None, temporal_extent: Optional[List[Union[str, datetime.datetime]]] = None, limit: int = None) -> Iterator[dict]:
@@ -882,9 +898,9 @@ class Connection(RestApiConnection):
 
     def datacube_from_process(self, process_id: str, namespace: str = None, **kwargs) -> DataCube:
         """
-        Load a raster datacube, from a custom process.
+        Load a data cube from a (custom) process.
 
-        :param process_id: The process id of the custom process.
+        :param process_id: The process id.
         :param namespace: optional: process namespace
         :param kwargs: The arguments of the custom process
         :return: A :py:class:`DataCube`, without valid metadata, as the client is not aware of this custom process.
@@ -1071,14 +1087,21 @@ class Connection(RestApiConnection):
         return result
 
     # TODO: unify `download` and `execute` better: e.g. `download` always writes to disk, `execute` returns result (raw or as JSON decoded dict)
-    def download(self, graph: dict, outputfile: Union[Path, str, None] = None, timeout:int=30*60):
+    def download(
+            self,
+            graph: Union[dict, str, Path],
+            outputfile: Union[Path, str, None] = None,
+            timeout: int = 30 * 60,
+    ):
         """
         Downloads the result of a process graph synchronously,
         and save the result to the given file or return bytes object if no outputfile is specified.
         This method is useful to export binary content such as images. For json content, the execute method is recommended.
 
-        :param graph: (flat) dict representing a process graph
+        :param graph: (flat) dict representing a process graph, or process graph as raw JSON string,
+            or as local file path or URL
         :param outputfile: output file
+        :param timeout: timeout to wait for response
         """
         request = self._build_request_with_process_graph(process_graph=graph)
         response = self.post(path="/result", json=request, expected_status=200, stream=True, timeout=timeout)
@@ -1090,24 +1113,28 @@ class Connection(RestApiConnection):
         else:
             return response.content
 
-    def execute(self, process_graph: dict):
+    def execute(self, process_graph: Union[dict, str, Path]):
         """
         Execute a process graph synchronously and return the result (assumed to be JSON).
 
-        :param process_graph: (flat) dict representing a process graph
+        :param process_graph: (flat) dict representing a process graph, or process graph as raw JSON string,
+            or as local file path or URL
+        :return: parsed JSON response
         """
         req = self._build_request_with_process_graph(process_graph=process_graph)
         return self.post(path="/result", json=req, expected_status=200).json()
 
     def create_job(
-            self, process_graph: dict, title: Optional[str] = None, description: Optional[str] = None,
+            self, process_graph: Union[dict, str, Path],
+            title: Optional[str] = None, description: Optional[str] = None,
             plan: Optional[str] = None, budget: Optional[float] = None,
             additional: Optional[dict] = None
     ) -> BatchJob:
         """
         Posts a job to the back end.
 
-        :param process_graph: (flat) dict representing process graph
+        :param process_graph: (flat) dict representing a process graph, or process graph as raw JSON string,
+            or as local file path or URL
         :param title: String title of the job
         :param description: String description of the job
         :param plan: billing plan

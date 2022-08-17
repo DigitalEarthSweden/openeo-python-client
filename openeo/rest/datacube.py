@@ -8,8 +8,6 @@ be evaluated by an openEO backend.
 
 """
 import datetime
-import inspect
-import json
 import logging
 import pathlib
 import typing
@@ -26,9 +24,9 @@ from shapely.geometry import Polygon, MultiPolygon, mapping
 import openeo
 import openeo.processes
 from openeo.api.process import Parameter
-from openeo.imagecollection import ImageCollection
 from openeo.internal.documentation import openeo_process
-from openeo.internal.graph_building import PGNode, ReduceNode
+from openeo.internal.graph_building import PGNode, ReduceNode, _FromNodeMixin
+from openeo.internal.processes.builder import get_parameter_names, convert_callable_to_pgnode
 from openeo.metadata import CollectionMetadata, Band, BandDimension
 from openeo.processes import ProcessBuilder
 from openeo.rest import BandMathException, OperatorException, OpenEoClientException
@@ -61,17 +59,6 @@ class DataCube(_ProcessGraphAbstraction):
     def __init__(self, graph: PGNode, connection: 'openeo.Connection', metadata: CollectionMetadata = None):
         super().__init__(pgnode=graph,  connection=connection)
         self.metadata = CollectionMetadata.get_or_create(metadata)
-
-    @property
-    @deprecated(reason="Use :py:meth:`DataCube.flat_graph()` instead.", version="0.9.0")
-    def graph(self) -> dict:
-        """
-        Get the process graph in flat dict representation.
-
-        .. note:: This property is mainly for internal use, subject to change and not recommended for general usage.
-        """
-        # TODO: is it feasible to just remove this property?
-        return self.flat_graph()
 
     def process(
             self,
@@ -475,12 +462,13 @@ class DataCube(_ProcessGraphAbstraction):
         else:
             if isinstance(other, DataCube):
                 return self._merge_operator_binary_cubes(operator, other)
-            elif isinstance(other, (int, float)) and not reverse:
+            elif isinstance(other, (int, float)):
+                if reverse:
+                    args = {"x": other, "y": {"from_parameter": "x"}}
+                else:
+                    args = {"x": {"from_parameter": "x"}, "y": other}
                 # TODO #123: support appending to pre-existing apply process instead of adding a whole new one
-                return self.apply(process=PGNode(
-                    process_id=operator,
-                    arguments={"x": {"from_parameter": "x"}, "y": other}
-                ))
+                return self.apply(process=PGNode(process_id=operator, arguments=args))
         raise OperatorException("Unsupported operator {op!r} with {other!r} (band math mode={b})".format(
             op=operator, other=other, b=band_math_mode))
 
@@ -500,8 +488,8 @@ class DataCube(_ProcessGraphAbstraction):
         return self._operator_binary("subtract", other, reverse=reverse)
 
     @openeo_process(mode="operator")
-    def divide(self, other: Union['DataCube', int, float]) -> 'DataCube':
-        return self._operator_binary("divide", other)
+    def divide(self, other: Union['DataCube', int, float], reverse=False) -> 'DataCube':
+        return self._operator_binary("divide", other, reverse=reverse)
 
     @openeo_process(mode="operator")
     def multiply(self, other: Union['DataCube', int, float], reverse=False) -> 'DataCube':
@@ -623,6 +611,10 @@ class DataCube(_ProcessGraphAbstraction):
     def __truediv__(self, other) -> 'DataCube':
         return self.divide(other)
 
+    @openeo_process(process_id="divide", mode="operator")
+    def __rtruediv__(self, other) -> 'DataCube':
+        return self.divide(other, reverse=True)
+
     @openeo_process(process_id="power", mode="operator")
     def __rpow__(self, other) -> 'DataCube':
         return self._power(other, reverse=True)
@@ -729,7 +721,7 @@ class DataCube(_ProcessGraphAbstraction):
 
     def _get_geometry_argument(
             self,
-            geometry: Union[shapely.geometry.base.BaseGeometry, dict, str, pathlib.Path, Parameter],
+            geometry: Union[shapely.geometry.base.BaseGeometry, dict, str, pathlib.Path, Parameter, _FromNodeMixin],
             valid_geojson_types: List[str],
             crs: str = None,
     ) -> Union[dict, Parameter, PGNode]:
@@ -743,6 +735,8 @@ class DataCube(_ProcessGraphAbstraction):
             return PGNode(process_id="read_vector", arguments={"filename": str(geometry)})
         elif isinstance(geometry, Parameter):
             return geometry
+        elif isinstance(geometry, _FromNodeMixin):
+            return geometry.from_node()
 
         if isinstance(geometry, shapely.geometry.base.BaseGeometry):
             geometry = mapping(geometry)
@@ -763,7 +757,7 @@ class DataCube(_ProcessGraphAbstraction):
     @openeo_process
     def aggregate_spatial(
             self,
-            geometries: Union[shapely.geometry.base.BaseGeometry, dict, str, pathlib.Path, Parameter],
+            geometries: Union[shapely.geometry.base.BaseGeometry, dict, str, pathlib.Path, Parameter, "VectorCube"],
             reducer: Union[str, PGNode, typing.Callable],
             target_dimension: Optional[str] = None,
             crs: str = None,
@@ -806,15 +800,7 @@ class DataCube(_ProcessGraphAbstraction):
         :param parent_parameters: list of parameter names defined for child process
         :return:
         """
-
-        def get_parameter_names(process: typing.Callable) -> List[str]:
-            signature = inspect.signature(process)
-            return [
-                p.name for p in signature.parameters.values()
-                if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-            ]
-
-        # TODO: autodetect the parameters defined by process?
+        # TODO: autodetect the parameters defined by parent process?
         if isinstance(process, PGNode):
             # Assume this is already a valid callback process
             pg = process
@@ -822,31 +808,20 @@ class DataCube(_ProcessGraphAbstraction):
             # Assume given reducer is a simple predefined reduce process_id
             if process in openeo.processes.__dict__:
                 process_params = get_parameter_names(openeo.processes.__dict__[process])
+                # TODO: switch to "Callable" handling here
             else:
                 # Best effort guess
                 process_params = parent_parameters
             if parent_parameters == ["x", "y"] and (len(process_params) == 1 or process_params[:1] == ["data"]):
                 # Special case: wrap all parent parameters in an array
                 arguments = {process_params[0]: [{"from_parameter": p} for p in parent_parameters]}
-            elif parent_parameters == ["data", "context"] and "context" not in process_params:
-                arguments = {process_params[0]: {"from_parameter": "data"}}
             else:
-                arguments = {a: {"from_parameter": b} for a, b in zip(process_params, parent_parameters)}
+                # Only pass parameters that correspond with an arg name
+                common = set(process_params).intersection(parent_parameters)
+                arguments = {p: {"from_parameter": p} for p in common}
             pg = PGNode(process_id=process, arguments=arguments)
         elif isinstance(process, typing.Callable):
-            process_params = get_parameter_names(process)
-            if parent_parameters == ["x", "y"] and (len(process_params) == 1 or process_params[:1] == ["data"]):
-                # Special case: wrap all parent parameters in an array
-                arguments = [ProcessBuilder([{"from_parameter": p} for p in parent_parameters])]
-            elif parent_parameters == ["data", "context"] and "context" not in process_params:
-                arguments = [ProcessBuilder({"from_parameter": "data"})]
-            else:
-                arguments = [ProcessBuilder({"from_parameter": p}) for p in parent_parameters]
-
-            callback_result = process(*arguments)
-            if callback_result is None:
-                raise ValueError("Your callback did not return a result, make sure that your callbacks have a return statement, and return a ProcessBuilder: " + str(process))
-            pg = callback_result.pgnode
+            pg = convert_callable_to_pgnode(process, parent_parameters=parent_parameters)
         else:
             raise ValueError(process)
 
@@ -947,7 +922,7 @@ class DataCube(_ProcessGraphAbstraction):
     # @openeo_process
     def chunk_polygon(
             self,
-            chunks: Union[shapely.geometry.base.BaseGeometry, dict, str, pathlib.Path, Parameter],
+            chunks: Union[shapely.geometry.base.BaseGeometry, dict, str, pathlib.Path, Parameter, "VectorCube"],
             process: Union[str, PGNode, typing.Callable],
             mask_value: float = None,
             context: Optional[dict] = None,
@@ -1120,7 +1095,7 @@ class DataCube(_ProcessGraphAbstraction):
         )
 
     @openeo_process(process_id="reduce_dimension")
-    def reduce_temporal_simple(self, process_id="max") -> 'DataCube':
+    def reduce_temporal_simple(self, process_id: str) -> 'DataCube':
         """Do temporal reduce with a simple given process as callback."""
         return self._reduce_temporal(reducer=PGNode(
             process_id=process_id,
@@ -1177,19 +1152,20 @@ class DataCube(_ProcessGraphAbstraction):
             dimension: Optional[str] = None,
             context: Optional[dict] = None,
     ) -> "DataCube":
-        """ Computes a temporal aggregation based on an array of date and/or time intervals.
+        """
+        Computes a temporal aggregation based on an array of date and/or time intervals.
 
-            Calendar hierarchies such as year, month, week etc. must be transformed into specific intervals by the clients. For each interval, all data along the dimension will be passed through the reducer. The computed values will be projected to the labels, so the number of labels and the number of intervals need to be equal.
+        Calendar hierarchies such as year, month, week etc. must be transformed into specific intervals by the clients. For each interval, all data along the dimension will be passed through the reducer. The computed values will be projected to the labels, so the number of labels and the number of intervals need to be equal.
 
-            If the dimension is not set, the data cube is expected to only have one temporal dimension.
+        If the dimension is not set, the data cube is expected to only have one temporal dimension.
 
-            :param intervals: Temporal left-closed intervals so that the start time is contained, but not the end time.
-            :param reducer: A reducer to be applied on all values along the specified dimension. The reducer must be a callable process (or a set processes) that accepts an array and computes a single return value of the same type as the input values, for example median.
-            :param labels: Labels for the intervals. The number of labels and the number of groups need to be equal.
-            :param dimension: The temporal dimension for aggregation. All data along the dimension will be passed through the specified reducer. If the dimension is not set, the data cube is expected to only have one temporal dimension.
-            :param context: Additional data to be passed to the reducer. Not set by default.
+        :param intervals: Temporal left-closed intervals so that the start time is contained, but not the end time.
+        :param reducer: A reducer to be applied on all values along the specified dimension. The reducer must be a callable process (or a set processes) that accepts an array and computes a single return value of the same type as the input values, for example median.
+        :param labels: Labels for the intervals. The number of labels and the number of groups need to be equal.
+        :param dimension: The temporal dimension for aggregation. All data along the dimension will be passed through the specified reducer. If the dimension is not set, the data cube is expected to only have one temporal dimension.
+        :param context: Additional data to be passed to the reducer. Not set by default.
 
-            :return: An ImageCollection containing  a result for each time window
+        :return: An ImageCollection containing  a result for each time window
         """
         return self.process(
             process_id="aggregate_temporal",
@@ -1211,32 +1187,33 @@ class DataCube(_ProcessGraphAbstraction):
             dimension: Optional[str] = None,
             context: Optional[Dict] = None,
     ) -> "DataCube":
-        """ Computes a temporal aggregation based on calendar hierarchies such as years, months or seasons. For other calendar hierarchies aggregate_temporal can be used.
+        """
+        Computes a temporal aggregation based on calendar hierarchies such as years, months or seasons. For other calendar hierarchies aggregate_temporal can be used.
 
-            For each interval, all data along the dimension will be passed through the reducer.
+        For each interval, all data along the dimension will be passed through the reducer.
 
-            If the dimension is not set or is set to null, the data cube is expected to only have one temporal dimension.
+        If the dimension is not set or is set to null, the data cube is expected to only have one temporal dimension.
 
-            The period argument specifies the time intervals to aggregate. The following pre-defined values are available:
+        The period argument specifies the time intervals to aggregate. The following pre-defined values are available:
 
-            - hour: Hour of the day
-            - day: Day of the year
-            - week: Week of the year
-            - dekad: Ten day periods, counted per year with three periods per month (day 1 - 10, 11 - 20 and 21 - end of month). The third dekad of the month can range from 8 to 11 days. For example, the fourth dekad is Feb, 1 - Feb, 10 each year.
-            - month: Month of the year
-            - season: Three month periods of the calendar seasons (December - February, March - May, June - August, September - November).
-            - tropical-season: Six month periods of the tropical seasons (November - April, May - October).
-            - year: Proleptic years
-            - decade: Ten year periods (0-to-9 decade), from a year ending in a 0 to the next year ending in a 9.
-            - decade-ad: Ten year periods (1-to-0 decade) better aligned with the Anno Domini (AD) calendar era, from a year ending in a 1 to the next year ending in a 0.
+        - hour: Hour of the day
+        - day: Day of the year
+        - week: Week of the year
+        - dekad: Ten day periods, counted per year with three periods per month (day 1 - 10, 11 - 20 and 21 - end of month). The third dekad of the month can range from 8 to 11 days. For example, the fourth dekad is Feb, 1 - Feb, 10 each year.
+        - month: Month of the year
+        - season: Three month periods of the calendar seasons (December - February, March - May, June - August, September - November).
+        - tropical-season: Six month periods of the tropical seasons (November - April, May - October).
+        - year: Proleptic years
+        - decade: Ten year periods (0-to-9 decade), from a year ending in a 0 to the next year ending in a 9.
+        - decade-ad: Ten year periods (1-to-0 decade) better aligned with the Anno Domini (AD) calendar era, from a year ending in a 1 to the next year ending in a 0.
 
 
-            :param period: The period of the time intervals to aggregate.
-            :param reducer: A reducer to be applied on all values along the specified dimension. The reducer must be a callable process (or a set processes) that accepts an array and computes a single return value of the same type as the input values, for example median.
-            :param dimension: The temporal dimension for aggregation. All data along the dimension will be passed through the specified reducer. If the dimension is not set, the data cube is expected to only have one temporal dimension.
-            :param context: Additional data to be passed to the reducer.
+        :param period: The period of the time intervals to aggregate.
+        :param reducer: A reducer to be applied on all values along the specified dimension. The reducer must be a callable process (or a set processes) that accepts an array and computes a single return value of the same type as the input values, for example median.
+        :param dimension: The temporal dimension for aggregation. All data along the dimension will be passed through the specified reducer. If the dimension is not set, the data cube is expected to only have one temporal dimension.
+        :param context: Additional data to be passed to the reducer.
 
-            :return: A data cube with the same dimensions. The dimension properties (name, type, labels, reference system and resolution) remain unchanged.
+        :return: A data cube with the same dimensions. The dimension properties (name, type, labels, reference system and resolution) remain unchanged.
         """
         return self.process(
             process_id="aggregate_temporal_period",
@@ -1251,13 +1228,14 @@ class DataCube(_ProcessGraphAbstraction):
 
     @openeo_process
     def ndvi(self, nir: str = None, red: str = None, target_band: str = None) -> 'DataCube':
-        """ Normalized Difference Vegetation Index (NDVI)
+        """
+        Normalized Difference Vegetation Index (NDVI)
 
-            :param nir: (optional) name of NIR band
-            :param red: (optional) name of red band
-            :param target_band: (optional) name of the newly created band
+        :param nir: (optional) name of NIR band
+        :param red: (optional) name of red band
+        :param target_band: (optional) name of the newly created band
 
-            :return: a DataCube instance
+        :return: a DataCube instance
         """
         if target_band is None:
             metadata = self.metadata.reduce_dimension(self.metadata.band_dimension.name)
@@ -1296,13 +1274,14 @@ class DataCube(_ProcessGraphAbstraction):
 
     @openeo_process
     def rename_labels(self, dimension: str, target: list, source: list = None) -> 'DataCube':
-        """ Renames the labels of the specified dimension in the data cube from source to target.
+        """
+        Renames the labels of the specified dimension in the data cube from source to target.
 
-            :param dimension: Dimension name
-            :param target: The new names for the labels.
-            :param source: The names of the labels as they are currently in the data cube.
+        :param dimension: Dimension name
+        :param target: The new names for the labels.
+        :param source: The names of the labels as they are currently in the data cube.
 
-            :return: An DataCube instance
+        :return: An DataCube instance
         """
         return self.process(
             process_id='rename_labels',
@@ -1362,7 +1341,7 @@ class DataCube(_ProcessGraphAbstraction):
     @openeo_process
     def mask_polygon(
             self,
-            mask: Union[shapely.geometry.base.BaseGeometry, dict, str, pathlib.Path, Parameter],
+            mask: Union[shapely.geometry.base.BaseGeometry, dict, str, pathlib.Path, Parameter, "VectorCube"],
             srs: str = None,
             replacement=None, inside: bool = None
     ) -> 'DataCube':
@@ -1427,10 +1406,16 @@ class DataCube(_ProcessGraphAbstraction):
         arguments = {'cube1': self, 'cube2': other}
         if overlap_resolver:
             arguments["overlap_resolver"] = self._get_callback(overlap_resolver, parent_parameters=["x", "y"])
+        # Minimal client side metadata merging
+        merged_metadata = self.metadata
+        if self.metadata.has_band_dimension() and isinstance(other, DataCube) and other.metadata.has_band_dimension():
+            for b in other.metadata.band_dimension.bands:
+                if b not in merged_metadata.bands:
+                    merged_metadata = merged_metadata.append_band(b)
+        # TODO: warn about missing overlap_resolver if we can detect that one is required?
         if context:
             arguments["context"] = context
-        # TODO: set metadata of reduced cube?
-        return self.process(process_id="merge_cubes", arguments=arguments)
+        return self.process(process_id="merge_cubes", arguments=arguments, metadata=merged_metadata)
 
     merge = legacy_alias(merge_cubes, name="merge")
 
@@ -1665,6 +1650,10 @@ class DataCube(_ProcessGraphAbstraction):
         :param format_options: String Parameters for the job result format
 
         """
+        if "format" in format_options and not out_format:
+            out_format = format_options["format"] #align with 'download' call arg name
+        if not out_format:
+            out_format = guess_format(outputfile) if outputfile else "GTiff"
         job = self.create_job(out_format, job_options=job_options, **format_options)
         return job.run_synchronous(
             outputfile=outputfile,
@@ -1739,8 +1728,9 @@ class DataCube(_ProcessGraphAbstraction):
     @openeo_process
     def ard_normalized_radar_backscatter(self, elevation_model:str = None, contributing_area = False, ellipsoid_incidence_angle:bool = False, noise_removal:bool = True):
         """
-        Computes CARD4L compliant backscatter (gamma0) from SAR input. This method is a variant of :meth:`openeo.rest.datacube.DataCube.sar_backscatter`,
-         with restricted parameters to generate backscatter according to CARD4L specifications.
+        Computes CARD4L compliant backscatter (gamma0) from SAR input.
+        This method is a variant of :py:meth:`~openeo.rest.datacube.DataCube.sar_backscatter`,
+        with restricted parameters to generate backscatter according to CARD4L specifications.
 
         Note that backscatter computation may require instrument specific metadata that is tightly coupled to the original SAR products.
         As a result, this process may only work in combination with loading data from specific collections, not with general data cubes.
@@ -1840,7 +1830,7 @@ class DataCube(_ProcessGraphAbstraction):
 
         :param parameters:
         :param function: "child callback" function, see :ref:`callbackfunctions`
-        :dimension:
+        :param dimension:
         """
         return self.process(process_id="fit_curve", arguments={
             "data": THIS,

@@ -3,6 +3,8 @@
 Unit tests specifically for 1.0.0-style DataCube
 
 """
+import collections
+import io
 import pathlib
 import re
 import sys
@@ -14,13 +16,14 @@ import requests
 import shapely.geometry
 
 import openeo.metadata
+import openeo.processes
 from openeo.api.process import Parameter
 from openeo.internal.graph_building import PGNode
 from openeo.internal.process_graph_visitor import ProcessGraphVisitException
 from openeo.rest import OpenEoClientException
 from openeo.rest.connection import Connection
 from openeo.rest.datacube import THIS, DataCube, ProcessBuilder
-from .conftest import API_URL
+from .conftest import API_URL, setup_collection_metadata
 from ... import load_json_resource
 
 basic_geometry_types = [
@@ -62,17 +65,6 @@ def _get_leaf_node(cube: DataCube) -> dict:
     return node
 
 
-def test_datacube_graph(con100):
-    s2cube = con100.load_collection("S2")
-    with pytest.warns(DeprecationWarning, match=re.escape("Use `DataCube.flat_graph()` instead.")):
-        actual = s2cube.graph
-    assert actual == {'loadcollection1': {
-        'process_id': 'load_collection',
-        'arguments': {'id': 'S2', 'spatial_extent': None, 'temporal_extent': None},
-        'result': True
-    }}
-
-
 def test_datacube_flat_graph(con100):
     s2cube = con100.load_collection("S2")
     assert s2cube.flat_graph() == {'loadcollection1': {
@@ -80,16 +72,6 @@ def test_datacube_flat_graph(con100):
         'arguments': {'id': 'S2', 'spatial_extent': None, 'temporal_extent': None},
         'result': True
     }}
-
-
-def test_datacube_legacy_flatten(con100):
-    s2cube = con100.load_collection("S2")
-    with pytest.warns(DeprecationWarning, match="Call to deprecated method `flatten`, use `flat_graph` instead."):
-        assert s2cube.flatten() == {'loadcollection1': {
-            'process_id': 'load_collection',
-            'arguments': {'id': 'S2', 'spatial_extent': None, 'temporal_extent': None},
-            'result': True
-        }}
 
 
 @pytest.mark.parametrize(["kwargs", "expected"], [
@@ -354,6 +336,37 @@ def test_aggregate_spatial_context(con100: Connection):
     }
 
 
+@pytest.mark.parametrize("get_geometries", [
+    lambda c: PGNode("load_vector", url="https://geo.test/features.json"),
+    lambda c: openeo.processes.process("load_vector", url="https://geo.test/features.json"),
+    lambda c: c.datacube_from_process("load_vector", url="https://geo.test/features.json"),
+])
+def test_aggregate_spatial_geometry_from_node(con100: Connection, get_geometries):
+    cube = con100.load_collection("S2")
+    geometries = get_geometries(con100)
+    result = cube.aggregate_spatial(geometries=geometries, reducer="mean")
+    assert result.flat_graph() == {
+        "loadcollection1": {
+            "process_id": "load_collection",
+            "arguments": {"id": "S2", "spatial_extent": None, "temporal_extent": None}
+        },
+        "loadvector1": {
+            "process_id": "load_vector",
+            "arguments": {"url": "https://geo.test/features.json"}},
+        "aggregatespatial1": {
+            "process_id": "aggregate_spatial",
+            "arguments": {
+                "data": {"from_node": "loadcollection1"},
+                "geometries": {"from_node": "loadvector1"},
+                "reducer": {"process_graph": {
+                    "mean1": {"process_id": "mean", "arguments": {"data": {"from_parameter": "data"}}, "result": True}
+                }},
+            },
+            "result": True,
+        },
+    }
+
+
 def test_aggregate_temporal(con100: Connection):
     cube = con100.load_collection("S2")
     cube = cube.aggregate_temporal(
@@ -484,6 +497,34 @@ def test_mask_polygon_path(con100: Connection):
     }
 
 
+@pytest.mark.parametrize("get_geometries", [
+    lambda c: PGNode("load_vector", url="https://geo.test/features.json"),
+    lambda c: openeo.processes.process("load_vector", url="https://geo.test/features.json"),
+    lambda c: c.datacube_from_process("load_vector", url="https://geo.test/features.json"),
+])
+def test_mask_polygon_from_node(con100: Connection, get_geometries):
+    cube = con100.load_collection("S2")
+    geometries = get_geometries(con100)
+    result = cube.mask_polygon(mask=geometries)
+    assert result.flat_graph() == {
+        "loadcollection1": {
+            "process_id": "load_collection",
+            "arguments": {"id": "S2", "spatial_extent": None, "temporal_extent": None}
+        },
+        "loadvector1": {
+            "process_id": "load_vector",
+            "arguments": {"url": "https://geo.test/features.json"}},
+        "maskpolygon1": {
+            "process_id": "mask_polygon",
+            "arguments": {
+                "data": {"from_node": "loadcollection1"},
+                "mask": {"from_node": "loadvector1"},
+            },
+            "result": True,
+        },
+    }
+
+
 def test_mask_raster(con100: Connection):
     img = con100.load_collection("S2")
     mask = con100.load_collection("MASK")
@@ -526,6 +567,90 @@ def test_merge_cubes_context(con100: Connection):
         },
         "result": True
     }
+
+
+def test_merge_cubes_issue107(con100):
+    """https://github.com/Open-EO/openeo-python-client/issues/107"""
+    s2 = con100.load_collection("S2")
+    a = s2.filter_bands(['B02'])
+    b = s2.filter_bands(['B04'])
+    c = a.merge_cubes(b)
+
+    flat = c.flat_graph()
+    # There should be only one `load_collection` node (but two `filter_band` ones)
+    assert collections.Counter(n["process_id"] for n in flat.values()) == {
+        "load_collection": 1,
+        "filter_bands": 2,
+        "merge_cubes": 1,
+    }
+
+
+def test_merge_cubes_no_resolver(con100):
+    s2 = con100.load_collection("S2")
+    mask = con100.load_collection("MASK")
+    merged = s2.merge_cubes(mask)
+    assert s2.metadata.band_names == ["B02", "B03", "B04", "B08"]
+    assert mask.metadata.band_names == ["CLOUDS", "WATER"]
+    assert merged.metadata.band_names == ["B02", "B03", "B04", "B08", "CLOUDS", "WATER"]
+    assert merged.flat_graph() == load_json_resource("data/1.0.0/merge_cubes_no_resolver.json")
+
+
+def test_merge_cubes_max_resolver(con100):
+    s2 = con100.load_collection("S2")
+    mask = con100.load_collection("MASK")
+    merged = s2.merge_cubes(mask, overlap_resolver="max")
+    assert s2.metadata.band_names == ["B02", "B03", "B04", "B08"]
+    assert mask.metadata.band_names == ["CLOUDS", "WATER"]
+    assert merged.metadata.band_names == ["B02", "B03", "B04", "B08", "CLOUDS", "WATER"]
+    assert merged.flat_graph() == load_json_resource("data/1.0.0/merge_cubes_max.json")
+
+
+@pytest.mark.parametrize("overlap_resolver", [None, "max"])
+def test_merge_cubes_band_merging_disjunct(con100, requests_mock, overlap_resolver):
+    setup_collection_metadata(requests_mock=requests_mock, cid="S3", bands=["B2", "B3"])
+    setup_collection_metadata(requests_mock=requests_mock, cid="S4", bands=["C4", "C6"])
+
+    s3 = con100.load_collection("S3")
+    s4 = con100.load_collection("S4")
+    s3_m_s4 = s3.merge_cubes(s4, overlap_resolver=overlap_resolver)
+    s4_m_s3 = s4.merge_cubes(s3, overlap_resolver=overlap_resolver)
+    assert s3.metadata.band_names == ["B2", "B3"]
+    assert s4.metadata.band_names == ["C4", "C6"]
+    assert s3_m_s4.metadata.band_names == ["B2", "B3", "C4", "C6"]
+    assert s4_m_s3.metadata.band_names == ["C4", "C6", "B2", "B3"]
+
+    s3_f = s3.filter_bands(["B2"])
+    s4_f = s4.filter_bands(["C6", "C4"])
+    s3_f_m_s4_f = s3_f.merge_cubes(s4_f, overlap_resolver=overlap_resolver)
+    s4_f_m_s3_f = s4_f.merge_cubes(s3_f, overlap_resolver=overlap_resolver)
+    assert s3_f.metadata.band_names == ["B2"]
+    assert s4_f.metadata.band_names == ["C6", "C4"]
+    assert s3_f_m_s4_f.metadata.band_names == ["B2", "C6", "C4"]
+    assert s4_f_m_s3_f.metadata.band_names == ["C6", "C4", "B2"]
+
+
+@pytest.mark.parametrize("overlap_resolver", [None, "max"])
+def test_merge_cubes_band_merging_with_overlap(con100, requests_mock, overlap_resolver):
+    setup_collection_metadata(requests_mock=requests_mock, cid="S3", bands=["B2", "B3", "B5", "B8"])
+    setup_collection_metadata(requests_mock=requests_mock, cid="S4", bands=["B4", "B5", "B6"])
+
+    s3 = con100.load_collection("S3")
+    s4 = con100.load_collection("S4")
+    s3_m_s4 = s3.merge_cubes(s4, overlap_resolver=overlap_resolver)
+    s4_m_s3 = s4.merge_cubes(s3, overlap_resolver=overlap_resolver)
+    assert s3.metadata.band_names == ["B2", "B3", "B5", "B8"]
+    assert s4.metadata.band_names == ["B4", "B5", "B6"]
+    assert s3_m_s4.metadata.band_names == ["B2", "B3", "B5", "B8", "B4", "B6"]
+    assert s4_m_s3.metadata.band_names == ["B4", "B5", "B6", "B2", "B3", "B8"]
+
+    s3_f = s3.filter_bands(["B5", "B8"])
+    s4_f = s4.filter_bands(["B6", "B5"])
+    s3_f_m_s4_f = s3_f.merge_cubes(s4_f, overlap_resolver=overlap_resolver)
+    s4_f_m_s3_f = s4_f.merge_cubes(s3_f, overlap_resolver=overlap_resolver)
+    assert s3_f.metadata.band_names == ["B5", "B8"]
+    assert s4_f.metadata.band_names == ["B6", "B5"]
+    assert s3_f_m_s4_f.metadata.band_names == ["B5", "B8", "B6"]
+    assert s4_f_m_s3_f.metadata.band_names == ["B6", "B5", "B8"]
 
 
 def test_resample_cube_spatial(con100: Connection):
@@ -1294,32 +1419,34 @@ def test_save_result_format(con100, requests_mock):
     cube.save_result(format="pNg")
 
 
+EXPECTED_JSON_EXPORT_S2_NDVI = textwrap.dedent('''\
+  {
+    "process_graph": {
+      "loadcollection1": {
+        "process_id": "load_collection",
+        "arguments": {
+          "id": "S2",
+          "spatial_extent": null,
+          "temporal_extent": null
+        }
+      },
+      "ndvi1": {
+        "process_id": "ndvi",
+        "arguments": {
+          "data": {
+            "from_node": "loadcollection1"
+          }
+        },
+        "result": true
+      }
+    }
+  }''')
+
+
 @pytest.mark.skipif(sys.version_info < (3, 6), reason="requires 'insertion ordered' dicts from python3.6 or higher")
 def test_to_json(con100):
     ndvi = con100.load_collection("S2").ndvi()
-    expected = textwrap.dedent('''\
-      {
-        "process_graph": {
-          "loadcollection1": {
-            "process_id": "load_collection",
-            "arguments": {
-              "id": "S2",
-              "spatial_extent": null,
-              "temporal_extent": null
-            }
-          },
-          "ndvi1": {
-            "process_id": "ndvi",
-            "arguments": {
-              "data": {
-                "from_node": "loadcollection1"
-              }
-            },
-            "result": true
-          }
-        }
-      }''')
-    assert ndvi.to_json() == expected
+    assert ndvi.to_json() == EXPECTED_JSON_EXPORT_S2_NDVI
 
 
 @pytest.mark.skipif(sys.version_info < (3, 6), reason="requires 'insertion ordered' dicts from python3.6 or higher")
@@ -1329,6 +1456,22 @@ def test_to_json_compact(con100):
     assert ndvi.to_json(indent=None) == expected
     expected = '{"process_graph":{"loadcollection1":{"process_id":"load_collection","arguments":{"id":"S2","spatial_extent":null,"temporal_extent":null}},"ndvi1":{"process_id":"ndvi","arguments":{"data":{"from_node":"loadcollection1"}},"result":true}}}'
     assert ndvi.to_json(indent=None, separators=(',', ':')) == expected
+
+
+@pytest.mark.skipif(sys.version_info < (3, 6), reason="requires 'insertion ordered' dicts from python3.6 or higher")
+def test_print_json_default(con100, capsys):
+    ndvi = con100.load_collection("S2").ndvi()
+    ndvi.print_json()
+    stdout, stderr = capsys.readouterr()
+    assert stdout == EXPECTED_JSON_EXPORT_S2_NDVI + "\n"
+
+
+@pytest.mark.skipif(sys.version_info < (3, 6), reason="requires 'insertion ordered' dicts from python3.6 or higher")
+def test_print_json_file(con100):
+    ndvi = con100.load_collection("S2").ndvi()
+    f = io.StringIO()
+    ndvi.print_json(file=f)
+    assert f.getvalue() == EXPECTED_JSON_EXPORT_S2_NDVI + "\n"
 
 
 def test_sar_backscatter_defaults(con100):
@@ -1856,6 +1999,42 @@ def test_update_arguments_priority(con100):
             "arguments": {"id": "T3", "spatial_extent": None, "temporal_extent": None},
             "result": True,
         }
+    }
+
+
+@pytest.mark.parametrize(["math", "process", "args"], [
+    (lambda c: c + 1, "add", {"x": {"from_parameter": "x"}, "y": 1}),
+    (lambda c: 1 + c, "add", {"x": 1, "y": {"from_parameter": "x"}}),
+    (lambda c: c - 1.2, "subtract", {"x": {"from_parameter": "x"}, "y": 1.2}),
+    (lambda c: 1.2 - c, "subtract", {"x": 1.2, "y": {"from_parameter": "x"}}),
+    (lambda c: c * 2.5, "multiply", {"x": {"from_parameter": "x"}, "y": 2.5}),
+    (lambda c: 2.5 * c, "multiply", {"x": 2.5, "y": {"from_parameter": "x"}}),
+    (lambda c: c / 3, "divide", {"x": {"from_parameter": "x"}, "y": 3}),
+    (lambda c: 3 / c, "divide", {"x": 3, "y": {"from_parameter": "x"}}),
+    (lambda c: c > 4, "gt", {"x": {"from_parameter": "x"}, "y": 4}),
+    (lambda c: 4 > c, "lt", {"x": {"from_parameter": "x"}, "y": 4}),
+    (lambda c: c == 4, "eq", {"x": {"from_parameter": "x"}, "y": 4}),
+    (lambda c: 4 == c, "eq", {"x": {"from_parameter": "x"}, "y": 4}),
+])
+def test_apply_math_simple(con100, math, process, args):
+    """https://github.com/Open-EO/openeo-python-client/issues/323"""
+    cube = con100.load_collection("S2")
+    res = math(cube)
+    graph = res.flat_graph()
+    assert set(graph.keys()) == {"loadcollection1", "apply1"}
+    assert graph["apply1"] == {
+        "process_id": "apply",
+        "arguments": {
+            "data": {"from_node": "loadcollection1"},
+            "process": {"process_graph": {
+                f"{process}1": {
+                    "process_id": process,
+                    "arguments": args,
+                    "result": True,
+                }
+            }}
+        },
+        "result": True,
     }
 
 
